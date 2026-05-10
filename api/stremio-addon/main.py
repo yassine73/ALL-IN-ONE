@@ -1,6 +1,6 @@
 from fastapi import FastAPI
-from tmdb import get_popular_movies, get_movie_details
-from scrapper import get_1337x_streams, get_thepiratebay_streams
+from tmdb import get_popular_movies, get_movie_details, get_serie_details
+from scrapper import get_1337x_streams, get_thepiratebay_streams, get_nyaa_streams
 
 app = FastAPI()
 
@@ -64,6 +64,10 @@ def meta(id: str):
         }
     }
 
+@app.get("/meta/{type}/{id}.json")
+def meta(type:str, id: str):
+    return get_serie_details(type, id)
+
 # ----------------------------
 # 4. STREAM (PLAY LINKS)
 # ----------------------------
@@ -75,5 +79,15 @@ def stream(id: str):
     # ⚠️ Placeholder stream (you will replace later with real sources)
     streams = {
         "streams": get_thepiratebay_streams(data)
+    }
+    return streams
+
+@app.get("/stream/{type}/{id}:{season}:{episode}.json")
+def stream_serie(type: str, id: str, season: str, episode: str):
+    show_detail = get_serie_details(type, id)
+
+    # ⚠️ Placeholder stream (you will replace later with real sources)
+    streams = {
+        "streams": get_nyaa_streams(show_detail, season, episode)
     }
     return streams

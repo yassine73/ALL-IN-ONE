@@ -112,3 +112,40 @@ def get_thepiratebay_streams(movie_info):
             continue
     
     return data
+
+
+def get_nyaa_streams(show_detail, season, episode):
+    def _search_torrents(url):
+            headers = {
+                "User-Agent": "Mozilla/5.0"
+            }
+
+            res = requests.get(url, headers=headers)
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            results = []
+
+            table = soup.select(".table-responsive table tbody tr")
+
+            for row in table:
+                tds = row.find_all("td")
+                if len(tds) < 7:
+                    continue
+                title = tds[1].text.strip()
+                magnet_href = tds[2].select("a")[-1].get("href").strip()
+                seeders = int(tds[5].text.strip())
+                size = tds[3].text.strip()
+                results.append({
+                    "title": f"{title}",
+                    "infoHash": magnet_href.split("&")[0].split(":")[-1],
+                    "seeders": seeders,
+                    "size": size,
+                })
+
+            return sorted(results, key=lambda x: x["seeders"], reverse=True)
+
+    name = show_detail.get("meta").get("name").replace(" ", "+")
+    url = f"https://nyaa.si/?f=0&c=1_0&q={name}+s{str(season).zfill(2)}e{str(episode).zfill(2)}&s=seeders&o=desc"
+    print(url)
+    streams = _search_torrents(url)
+    return streams
