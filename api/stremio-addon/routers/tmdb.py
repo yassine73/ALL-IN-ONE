@@ -1,5 +1,10 @@
-import requests
-from config import TMDB_API_KEY, TMDB_BASE_URL
+import requests, os
+from config import TMDB_BASE_URL
+
+from dotenv import load_dotenv
+load_dotenv()
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 def get_popular_movies():
     url = f"{TMDB_BASE_URL}/movie/popular"
@@ -13,8 +18,7 @@ def get_movie_details(movie_id):
     r = requests.get(url, params=params)
     return r.json()
 
-def get_imdb_serie(imdb_id):
-    # Step 1: convert IMDb → TMDb
+def imdb_tmdb_converter(imdb_id):
     url = f"{TMDB_BASE_URL}/find/{imdb_id}"
 
     params = {
@@ -31,7 +35,11 @@ def get_imdb_serie(imdb_id):
     if not tv_results:
         return None
 
-    tmdb_id = tv_results[0]["id"]
+    return tv_results[0]["id"]
+
+def get_imdb_serie(imdb_id):
+    # Step 1: convert IMDb → TMDb
+    tmdb_id = imdb_tmdb_converter(imdb_id)
 
     # Step 2: fetch full TV details
     url = f"{TMDB_BASE_URL}/tv/{tmdb_id}"
@@ -39,12 +47,32 @@ def get_imdb_serie(imdb_id):
 
     return r.json()
 
-def get_serie_details(type:str, serie_id: str):
+def get_tmdb_alternative_titles(imdb_id):
+    tmdb_id = imdb_tmdb_converter(imdb_id)
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/alternative_titles"
+    r = requests.get(url, params={
+        "api_key": TMDB_API_KEY
+    })
+
+    data = r.json()
+
+    names = set()
+
+    print(data)
+    for item in data.get("results", []):
+        name = item.get("title")
+        if name:
+            names.add(name.strip())
+
+    return names
+
+def get_serie_details(type:str, imdb_id: str):
     if type == "series":
-        serie = get_imdb_serie(serie_id)
+        serie = get_imdb_serie(imdb_id)
+        
         return {
             "meta": {
-                "id": serie_id,
+                "id": imdb_id,
 
                 "type": "series",
 

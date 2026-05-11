@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from tmdb import get_popular_movies, get_movie_details, get_serie_details
+from routers.tmdb import get_popular_movies, get_movie_details, get_serie_details
 from scrapper import get_1337x_streams, get_thepiratebay_streams, get_nyaa_streams
 
 app = FastAPI()
@@ -77,8 +77,9 @@ def stream(id: str):
     data = get_movie_details(tmdb_id)
 
     # ⚠️ Placeholder stream (you will replace later with real sources)
+    print(data.get("title"))
     streams = {
-        "streams": get_thepiratebay_streams(data)
+        "streams": get_1337x_streams(data.get("title"))
     }
     return streams
 
