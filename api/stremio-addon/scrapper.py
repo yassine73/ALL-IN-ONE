@@ -24,14 +24,40 @@ _AUDIO_RE = re.compile(
 _HDR_RE = re.compile(r"\b(HDR10\+?|HDR|DV|Dolby ?Vision)\b", re.IGNORECASE)
 
 # Public trackers verified responsive via UDP BEP-15 connect handshake.
-# Re-verify periodically — dead trackers do nothing but add latency to magnets.
+# Ordered by measured latency (lowest first) so clients try the fastest first.
+# Deduped: same IP+port and same-server-different-port collapsed to one entry.
+# Re-verify periodically — dead trackers add latency without benefit.
 _TRACKERS = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://explodie.org:6969/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://tracker.dler.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",        # ~44 ms
+    "udp://54.36.179.216:6969/announce",                # ~46 ms
+    "udp://135.125.236.64:6969/announce",               # ~49 ms
+    "udp://tracker.auctor.tv:6969/announce",            # ~53 ms
+    "udp://107.189.4.235:1337/announce",                # ~55 ms
+    "udp://5.255.124.190:6969/announce",                # ~55 ms
+    "udp://107.189.7.165:6969/announce",                # ~56 ms
+    "udp://185.171.202.111:6969/announce",              # ~60 ms
+    "udp://tracker.filemail.com:6969/announce",         # ~60 ms
+    "udp://37.120.182.83:54123/announce",               # ~65 ms (also serves buddyfly.top/torrentclub.space)
+    "udp://tracker.srv00.com:6969/announce",            # ~74 ms
+    "udp://87.106.210.134:6969/announce",               # ~80 ms
+    "udp://88.80.22.67:2710/announce",                  # ~83 ms
+    "udp://81.230.84.201:6969/announce",                # ~84 ms
+    "udp://open.stealth.si:80/announce",                # ~85 ms
+    "udp://185.146.233.150:6969/announce",              # ~87 ms
+    "udp://torrents.artixlinux.org:6969/announce",      # ~92 ms
+    "udp://tracker.opentrackr.org:1337/announce",       # ~94 ms
+    "udp://94.72.140.51:6969/announce",                 # ~95 ms
+    "udp://34.66.57.33:1337/announce",                  # ~135 ms
+    "udp://192.3.130.53:1337/announce",                 # ~141 ms
+    "udp://94.136.190.183:1337/announce",               # ~148 ms
+    "udp://23.175.184.30:23333/announce",               # ~164 ms
+    "udp://209.141.59.25:6969/announce",                # ~184 ms
+    "udp://tracker.theoks.net:6969/announce",           # ~185 ms
+    "udp://189.18.162.12:6969/announce",                # ~205 ms
+    "udp://explodie.org:6969/announce",                 # ~214 ms
+    "udp://wepzone.net:6969/announce",                  # ~251 ms
+    "udp://open.demonii.com:1337/announce",             # ~304 ms
+    "udp://tracker.dler.com:6969/announce",             # ~333 ms
 ]
 
 
