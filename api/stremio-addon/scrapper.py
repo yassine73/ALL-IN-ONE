@@ -1,131 +1,260 @@
-import requests
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+import html
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote, urljoin
 
-def _get_soup(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    res = requests.get(url, headers=headers)
-    return BeautifulSoup(res.text, "html.parser")
+import requests
 
 
-def get_1337x_streams(query: str):
-    def _search_torrents(domain, url):
-        soup = _get_soup(url)
+_RESOLUTION_RE = re.compile(r"\b(2160p|1440p|1080p|720p|480p|360p)\b", re.IGNORECASE)
+_RESOLUTION_HINTS = (
+    (re.compile(r"\b(4k|uhd)\b", re.IGNORECASE), "2160p"),
+    (re.compile(r"\b(fhd|fullhd)\b", re.IGNORECASE), "1080p"),
+    (re.compile(r"\bhd\b", re.IGNORECASE), "720p"),
+)
+_QUALITY_RE = re.compile(
+    r"\b(REMUX|BluRay|BDRip|BRRip|WEB[- ]?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|TS|TC)\b",
+    re.IGNORECASE,
+)
+_CODEC_RE = re.compile(r"\b(x265|x264|h\.?265|h\.?264|HEVC|AVC|AV1)\b", re.IGNORECASE)
+_AUDIO_RE = re.compile(
+    r"\b(DDP?5\.1|DD\+|DTS(?:-HD)?(?:\.MA)?|TrueHD|Atmos|AAC|AC3|FLAC|MP3|Opus)\b",
+    re.IGNORECASE,
+)
+_HDR_RE = re.compile(r"\b(HDR10\+?|HDR|DV|Dolby ?Vision)\b", re.IGNORECASE)
 
-        results = []
+# Public trackers verified responsive via UDP BEP-15 connect handshake.
+# Re-verify periodically — dead trackers do nothing but add latency to magnets.
+_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.dler.com:6969/announce",
+]
 
-        table = soup.select(".table-list-wrap tr")
 
-        for idx, row in enumerate(table):
-            if idx == 0:
-                continue
-            title = row.select_one(".name").text.strip()
-            magnet_href = row.select(".name a")[-1].get("href")
-            seeders = int(row.select_one(".seeds").text.strip())
-            size = row.select_one(".size").text.strip()
-            results.append({
-                "title": title,
-                "infoHash": f"https://www.{domain}{magnet_href}",
-                "seeders": seeders,
-                "size": size,
-            })
+def _format_size(num_bytes):
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} PB"
 
-        print(len(results))
-        return sorted(results, key=lambda x: x["seeders"], reverse=True)
-    
-    def _scrape_detail(url):
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(res.text, "html.parser")
 
-        # example: extract torrent magnet or info
-        magnet = soup.select_one("a.torrentdown1").get("href").strip()
-        return magnet.split("&")[0].split(":")[-1].strip()
+def _first_match(pattern, text):
+    m = pattern.search(text)
+    return m.group(0) if m else None
 
-    data : list[dict] = []
-    domains = [
-        "1337x.tw",
-        "1337x.to",
-        "1377x.to",
-        "1337xx.to"
-    ]
 
-    while not data and domains:
-        domain = domains.pop(0)
-        url = f"https://www.{domain}/sort-category-search/{query}/Movies/seeders/desc/1/"
-        try:
-            data = _search_torrents(domain, url)
-        except:
-            continue
-    
-    for obj in data:
-        magnet_link = obj.get("infoHash")
-        obj["infoHash"] = _scrape_detail(magnet_link)
-    print(len(data))
-    return data
+def _extract_resolution(name: str):
+    m = _RESOLUTION_RE.search(name)
+    if m:
+        return m.group(1).lower()
+    for pattern, value in _RESOLUTION_HINTS:
+        if pattern.search(name):
+            return value
+    return None
 
-def extract_infohash(magnet: str):
-    match = re.search(r"btih:([a-fA-F0-9]+)", magnet)
-    return match.group(1) if match else None
 
 def scrape_piratebay(query: str):
-    url = f"https://thepiratebay.org/search/{query}/0/99/0"
+    try:
+        res = requests.get(
+            "https://apibay.org/q.php",
+            params={"q": query, "cat": "0"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        data = res.json()
+    except Exception:
+        return []
 
     results = []
+    for obj in data:
+        infohash = obj.get("info_hash")
+        if not infohash or infohash == "0" * 40:
+            continue
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        name = obj.get("name")
+        if not name:
+            continue
 
-        page.goto(url, timeout=60000)
+        try:
+            seeders = int(obj.get("seeders", 0))
+        except (TypeError, ValueError):
+            seeders = 0
+        try:
+            leechers = int(obj.get("leechers", 0))
+        except (TypeError, ValueError):
+            leechers = 0
 
-        # Wait for JS to render results
-        page.wait_for_timeout(5000)
+        size_bytes = int(obj.get("size") or 0) or None
+        size_str = _format_size(obj.get("size"))
+        resolution = _extract_resolution(name)
+        quality = _first_match(_QUALITY_RE, name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+        uploader = obj.get("username") or "anonymous"
 
-        # Try waiting for table rows (dynamic fallback)
-        page.wait_for_selector("li.list-entry", timeout=15000)
+        tag_line = " | ".join(t for t in (resolution, quality, codec, hdr, audio) if t)
+        stats = f"👤 {seeders} / {leechers}"
+        if size_str:
+            stats += f"  💾 {size_str}"
+        stats += f"  🏴‍☠️ {uploader}"
 
-        rows = page.query_selector_all("li.list-entry")
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
 
-        for row in rows:
-            try:
-                cols = row.query_selector_all("span")
-                if len(cols) < 8:
-                    continue
+        stream_name = "ThePirateBay"
+        if resolution:
+            stream_name += f"\n{resolution}"
 
-                # TITLE + MAGNET
-                title_el = cols[1].query_selector("a")
-                if not title_el:
-                    continue
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0,
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "behaviorHints": {
+                "bingeGroup": f"piratebay|{resolution or 'unknown'}",
+                "videoSize": size_bytes,
+                "filename": name,
+            },
+            "_seeders": seeders,
+        })
 
-                title = title_el.inner_text().strip()
+    return results
 
-                magnet_el = row.query_selector("a[href^='magnet:']")
-                magnet = magnet_el.get_attribute("href") if magnet_el else None
-                infohash = extract_infohash(magnet) if magnet else None
 
-                # SEEDERS / SIZE
-                seeders = cols[5].inner_text().strip()
-                size = cols[4].inner_text().strip() if len(cols) > 4 else None
-                uled_by = cols[7].inner_text().strip()
+# --- LimeTorrents ---------------------------------------------------------
 
-                # Skip invalid rows
-                if not title or not infohash:
-                    continue
+_LIME_BASE = "https://limetorrent.in"
+_LIME_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+_LIME_ROW_RE = re.compile(
+    r'<tr[^>]*>\s*<td class="tdleft">.*?'
+    r'<div class="tt-name">.*?<a\s+href="(?P<href>/post-detail/[^"]+)"[^>]*>(?P<name>.*?)</a>.*?'
+    r'<td class="tdnormal">(?P<date>[^<]*)</td>\s*'
+    r'<td class="tdnormal">(?P<size>[^<]*)</td>\s*'
+    r'<td class="tdseed">(?P<seed>[^<]*)</td>\s*'
+    r'<td class="tdleech">(?P<leech>[^<]*)</td>',
+    re.DOTALL,
+)
+_LIME_HASH_RE = re.compile(r"itorrents\.org/torrent/([A-Fa-f0-9]{40})\.torrent", re.IGNORECASE)
+_LIME_MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:([A-Fa-f0-9]{40})", re.IGNORECASE)
+_SIZE_UNIT_BYTES = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
 
-                results.append({
-                    "title": f"[{uled_by}] - {title}",
-                    "infoHash": infohash,
-                    "seeders": int(seeders) if seeders.isdigit() else 0,
-                    "size": size
-                })
 
-            except Exception:
-                continue
+def _parse_size_to_bytes(size_str: str):
+    m = re.match(r"\s*([\d.]+)\s*([KMGT]?B)\s*", size_str, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(float(m.group(1)) * _SIZE_UNIT_BYTES[m.group(2).upper()])
+    except (KeyError, ValueError):
+        return None
 
-        browser.close()
+
+def _lime_fetch_hash(session, detail_url):
+    try:
+        r = session.get(detail_url, timeout=15)
+        body = r.text
+    except Exception:
+        return None
+    m = _LIME_HASH_RE.search(body) or _LIME_MAGNET_RE.search(body)
+    return m.group(1).lower() if m else None
+
+
+def scrape_limetorrents(query: str, max_results: int = 20):
+    if not query:
+        return []
+
+    search_url = urljoin(_LIME_BASE, f"/get-posts/keywords:{quote(query)}/")
+    session = requests.Session()
+    session.headers.update({"User-Agent": _LIME_UA})
+
+    try:
+        res = session.get(search_url, timeout=20)
+        page = res.text
+    except Exception:
+        return []
+
+    rows = []
+    for m in _LIME_ROW_RE.finditer(page):
+        name = html.unescape(re.sub(r"<[^>]+>", "", m.group("name"))).strip()
+        if not name:
+            continue
+        try:
+            seeders = int(m.group("seed").strip() or 0)
+            leechers = int(m.group("leech").strip() or 0)
+        except ValueError:
+            seeders = leechers = 0
+        rows.append({
+            "name": name,
+            "detail_url": urljoin(_LIME_BASE, m.group("href")),
+            "size_str": m.group("size").strip(),
+            "seeders": seeders,
+            "leechers": leechers,
+        })
+        if len(rows) >= max_results:
+            break
+
+    if not rows:
+        return []
+
+    with ThreadPoolExecutor(max_workers=min(8, len(rows))) as ex:
+        future_to_row = {ex.submit(_lime_fetch_hash, session, r["detail_url"]): r for r in rows}
+        for fut in as_completed(future_to_row):
+            future_to_row[fut]["infohash"] = fut.result()
+
+    results = []
+    for row in rows:
+        infohash = row.get("infohash")
+        if not infohash:
+            continue
+
+        name = row["name"]
+        size_bytes = _parse_size_to_bytes(row["size_str"])
+        resolution = _extract_resolution(name)
+        quality = _first_match(_QUALITY_RE, name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+
+        tag_line = " | ".join(t for t in (resolution, quality, codec, hdr, audio) if t)
+        stats = f"👤 {row['seeders']} / {row['leechers']}"
+        if row["size_str"]:
+            stats += f"  💾 {row['size_str']}"
+        stats += "  🍋 LimeTorrents"
+
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
+
+        stream_name = "LimeTorrents"
+        if resolution:
+            stream_name += f"\n{resolution}"
+
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0,
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "behaviorHints": {
+                "bingeGroup": f"limetorrents|{resolution or 'unknown'}",
+                "videoSize": size_bytes,
+                "filename": name,
+            },
+            "_seeders": row["seeders"],
+        })
 
     return results
