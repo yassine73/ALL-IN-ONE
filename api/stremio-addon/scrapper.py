@@ -149,14 +149,368 @@ def scrape_piratebay(query: str):
             "infoHash": infohash,
             "fileIdx": 0,
             "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "_seeders": seeders,
+        })
+
+    return results
+
+
+# --- Nyaa (anime) ---------------------------------------------------------
+
+_NYAA_BASE = "https://nyaa.si"
+_NYAA_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+# Erai-raws release name patterns. Examples:
+#   [Erai-raws] Detective Conan - 1124 [1080p][Multiple Subtitle]...
+#   [Erai-raws] Detective Conan - 0001 ~ 0123 [1080p]...      (range)
+#   [Erai-raws] Some Show - S02 [1080p]                        (whole season)
+#   [Erai-raws] Some Show Season 2 [Batch][1080p]              (whole season)
+_ERAI_SINGLE_RE = re.compile(r"-\s*(\d{1,4})(?:v\d+)?\s*(?:\[|$)")
+_ERAI_RANGE_RE = re.compile(r"-\s*(\d{1,4})\s*~\s*(\d{1,4})")
+_ERAI_SEASON_RE = re.compile(r"\b(?:S(?:eason)?\s*0*(\d{1,2}))\b", re.IGNORECASE)
+_ERAI_BATCH_RE = re.compile(r"\bbatch\b", re.IGNORECASE)
+_ERAI_TAG_RE = re.compile(r"\[Erai-raws\]", re.IGNORECASE)
+
+
+def _classify_erai_release(name: str):
+    """Parse a release title into a structured descriptor.
+
+    Returns a dict:
+      {"kind": "range",  "low": int, "high": int, "season": int|None}
+      {"kind": "single", "n": int,                "season": int|None}
+      {"kind": "season", "season": int}
+      {"kind": "batch"}
+      {"kind": None}
+
+    A `season` field on range/single means the title explicitly mentions
+    "Season N" — the numbers should be interpreted per-season, not absolute.
+    """
+    season_m = _ERAI_SEASON_RE.search(name)
+    season_n = int(season_m.group(1)) if season_m else None
+
+    rng = _ERAI_RANGE_RE.search(name)
+    if rng:
+        return {"kind": "range", "low": int(rng.group(1)),
+                "high": int(rng.group(2)), "season": season_n}
+
+    is_batch = bool(_ERAI_BATCH_RE.search(name))
+    single = _ERAI_SINGLE_RE.search(name)
+    if single and not is_batch:
+        return {"kind": "single", "n": int(single.group(1)), "season": season_n}
+    if season_n is not None:
+        return {"kind": "season", "season": season_n}
+    if is_batch:
+        return {"kind": "batch"}
+    return {"kind": None}
+
+
+def _release_matches(classified, season: int, episode: int, absolute_episode: int):
+    """Decide if a classified release covers the requested episode.
+
+    Two numbering schemes need handling:
+      - per-season (e.g. Shingeki no Kyojin Season 3 - 01 ~ 12)
+      - absolute  (e.g. Detective Conan - 0754 ~ 1132)
+    A release that explicitly tags "Season N" uses per-season numbering when
+    N matches the request; otherwise the numbers are treated as absolute.
+    """
+    kind = classified["kind"]
+    if kind is None:
+        return False
+    if kind == "batch":
+        return True
+
+    rel_season = classified.get("season")
+    if rel_season is not None and rel_season != season:
+        # Release belongs to a different season — never matches.
+        return False
+    # If the release tags our season, numbers are per-season; otherwise absolute.
+    use_episode = episode if rel_season == season else absolute_episode
+
+    if kind == "single":
+        return classified["n"] == use_episode
+    if kind == "range":
+        return classified["low"] <= use_episode <= classified["high"]
+    if kind == "season":
+        return True  # season tag already matched above
+    return False
+
+
+_NYAA_USER_ROW_RE = re.compile(
+    r'<tr class="(?:default|success|danger)">'
+    r'.*?<a href="/view/(?P<id>\d+)"\s+title="(?P<title>[^"]+)"'
+    r'.*?magnet:\?xt=urn:btih:(?P<hash>[A-Fa-f0-9]{40})'
+    r'.*?<td class="text-center">(?P<size>[^<]+)</td>'
+    r'\s*<td class="text-center"[^>]*>[^<]+</td>'
+    r'\s*<td class="text-center">(?P<seeders>\d+)</td>'
+    r'\s*<td class="text-center">(?P<leechers>\d+)</td>',
+    re.DOTALL,
+)
+
+
+def _nyaa_user_fetch_page(user: str, query: str, page: int):
+    """Fetch one HTML page of a Nyaa user's uploads. Returns parsed rows.
+
+    The /user/<name> path lists every upload by that user, including older
+    batches that the global search index quietly drops. The RSS variant of
+    this path returns nothing, so we parse the HTML.
+    """
+    url = f"{_NYAA_BASE}/user/{quote(user)}?q={quote(query)}&c=1_2&p={page}"
+    try:
+        res = requests.get(url, headers={"User-Agent": _NYAA_UA}, timeout=25)
+        body = res.text
+    except Exception:
+        return []
+
+    rows = []
+    for m in _NYAA_USER_ROW_RE.finditer(body):
+        rows.append({
+            "view_id": m.group("id"),
+            "title": html.unescape(m.group("title")).strip(),
+            "infohash": m.group("hash").lower(),
+            "size_str": m.group("size").strip(),
+            "seeders": int(m.group("seeders")),
+            "leechers": int(m.group("leechers")),
+        })
+    return rows
+
+
+def _nyaa_user_paginated(user: str, query: str, max_pages: int = 15):
+    """Yield rows across pages, stopping at first short/empty page."""
+    for page in range(1, max_pages + 1):
+        rows = _nyaa_user_fetch_page(user, query, page)
+        if not rows:
+            return
+        for r in rows:
+            yield r
+        if len(rows) < 70:  # Nyaa serves ~75/page; short page = last page
+            return
+
+
+_VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm")
+
+
+def _bdecode(data: bytes, pos: int = 0):
+    """Minimal bencode decoder. Returns (value, next_pos)."""
+    c = data[pos:pos + 1]
+    if c == b"i":
+        end = data.index(b"e", pos)
+        return int(data[pos + 1:end]), end + 1
+    if c == b"l":
+        out = []
+        pos += 1
+        while data[pos:pos + 1] != b"e":
+            v, pos = _bdecode(data, pos)
+            out.append(v)
+        return out, pos + 1
+    if c == b"d":
+        out = {}
+        pos += 1
+        while data[pos:pos + 1] != b"e":
+            k, pos = _bdecode(data, pos)
+            v, pos = _bdecode(data, pos)
+            out[k] = v
+        return out, pos + 1
+    # string: <len>:<bytes>
+    colon = data.index(b":", pos)
+    length = int(data[pos:colon])
+    start = colon + 1
+    return data[start:start + length], start + length
+
+
+def _torrent_file_list(view_id: str):
+    """Fetch a Nyaa torrent and return its ordered file list.
+
+    Returns a list of dicts: [{"index": i, "name": basename, "size": bytes}].
+    Single-file torrents return one entry with index 0.
+    """
+    try:
+        r = requests.get(
+            f"{_NYAA_BASE}/download/{view_id}.torrent",
+            headers={"User-Agent": _NYAA_UA},
+            timeout=30,
+        )
+        if r.status_code != 200 or not r.content.startswith(b"d"):
+            return []
+        meta, _ = _bdecode(r.content)
+    except Exception:
+        return []
+
+    info = meta.get(b"info") or {}
+    files = info.get(b"files")
+    if not files:
+        # Single-file torrent
+        name = (info.get(b"name") or b"").decode("utf-8", "replace")
+        size = info.get(b"length") or 0
+        return [{"index": 0, "name": name, "size": size}] if name else []
+
+    out = []
+    for i, f in enumerate(files):
+        path_parts = [p.decode("utf-8", "replace") for p in (f.get(b"path") or [])]
+        name = path_parts[-1] if path_parts else ""
+        out.append({"index": i, "name": name, "size": f.get(b"length") or 0})
+    return out
+
+
+def _resolve_episode_file_idx(view_id: str, absolute_episode: int):
+    """Find the file index inside a multi-file torrent matching `absolute_episode`.
+
+    Matches the episode number with any zero-padding (1/01/001/0001), bounded
+    so it isn't a substring of a larger number. Among matches, prefers video
+    file extensions and the largest size as a tiebreaker. Returns None if
+    no confident match.
+    """
+    files = _torrent_file_list(view_id)
+    if not files:
+        return None
+    if len(files) == 1:
+        return 0
+
+    # Episode number, possibly zero-padded, surrounded by non-digit boundaries.
+    # Strip bracketed tags first ([1080p], [Multiple Subtitle], [CRC32-hash])
+    # so digits inside CRC32 checksums aren't mistaken for episode numbers.
+    bracket_re = re.compile(r"\[[^\]]*\]")
+    ep_re = re.compile(rf"(?<!\d)0*{absolute_episode}(?!\d)")
+
+    candidates = []
+    for f in files:
+        name = f["name"]
+        cleaned = bracket_re.sub(" ", name)
+        if not ep_re.search(cleaned):
+            continue
+        is_video = name.lower().endswith(_VIDEO_EXTS)
+        candidates.append((is_video, f["size"], f["index"], name))
+
+    if not candidates:
+        return None
+    # Prefer videos, then largest size.
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    return candidates[0][2]
+
+
+def scrape_nyaa_erai(title: str, season: int, episode: int,
+                     absolute_episode: int = None,
+                     max_results: int = 1500, max_pages_per_query: int = 20):
+    """Search Nyaa for [Erai-raws] releases of `title` matching the episode.
+
+    `episode` is the per-season episode; `absolute_episode` (if known) is the
+    absolute episode number used by anime release groups. Matches single
+    episodes, combined ranges (0001 ~ 0123), full seasons, and batches.
+
+    Paginates each query — Nyaa serves ~75 items per RSS page, so a long-
+    running anime's older releases require walking past page 1.
+    """
+    if not title:
+        return []
+
+    # Scrape directly from the Erai-raws user-uploads page rather than the
+    # global Nyaa search. The global search index quietly omits some older
+    # batches (e.g. "Detective Conan - 0001 ~ 0123" never surfaces under
+    # `[Erai-raws] Detective Conan`), but they're all on /user/Erai-raws.
+    # Filter as we paginate and stop once we have enough matches to avoid
+    # walking the full feed for long-running series.
+    abs_ep = absolute_episode if absolute_episode is not None else episode
+    enough = 6  # stop once we have this many matches across qualities
+
+    matched_rows = []
+    seen_hashes = set()
+    scanned = 0
+    for row in _nyaa_user_paginated("Erai-raws", title, max_pages=max_pages_per_query):
+        scanned += 1
+        if scanned > max_results:
+            break
+        ih = row["infohash"]
+        if ih in seen_hashes:
+            continue
+        seen_hashes.add(ih)
+
+        name = row["title"]
+        if not _ERAI_TAG_RE.search(name):
+            continue
+        classified = _classify_erai_release(name)
+        if not _release_matches(classified, season, episode, abs_ep):
+            continue
+        matched_rows.append((row, classified))
+        if len(matched_rows) >= enough:
+            break
+
+    # Resolve fileIdx in parallel for any non-single torrent — Stremio needs
+    # it to pick the right episode out of a batch/range release. Skip for
+    # single-episode torrents (always index 0). For each torrent, search using
+    # the right episode number (per-season vs absolute).
+    needs_idx = []
+    for i, (row, cls) in enumerate(matched_rows):
+        if cls["kind"] == "single":
+            continue
+        rel_season = cls.get("season")
+        ep_for_file = episode if rel_season == season else abs_ep
+        needs_idx.append((i, row["view_id"], ep_for_file))
+
+    file_idx_by_pos = {}
+    if needs_idx:
+        with ThreadPoolExecutor(max_workers=min(6, len(needs_idx))) as ex:
+            futs = {
+                ex.submit(_resolve_episode_file_idx, vid, ep_for_file): pos
+                for pos, vid, ep_for_file in needs_idx
+            }
+            for fut in as_completed(futs):
+                file_idx_by_pos[futs[fut]] = fut.result()
+
+    results = []
+    for pos, (row, classified) in enumerate(matched_rows):
+        name = row["title"]
+        infohash = row["infohash"]
+        seeders = row["seeders"]
+        leechers = row["leechers"]
+        size_str = row["size_str"]
+        size_bytes = _parse_size_to_bytes(size_str) if size_str else None
+
+        resolution = _extract_resolution(name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+
+        kind = classified["kind"]
+        if kind == "single":
+            kind_tag = f"E{classified['n']:02d}"
+        elif kind == "range":
+            kind_tag = f"E{classified['low']:02d}-E{classified['high']:02d}"
+        elif kind == "season":
+            kind_tag = f"S{classified['season']:02d}"
+        elif kind == "batch":
+            kind_tag = "BATCH"
+        else:
+            kind_tag = None
+
+        tag_line = " | ".join(t for t in (resolution, kind_tag, codec, hdr, audio) if t)
+        stats = f"👤 {seeders} / {leechers}"
+        if size_str:
+            stats += f"  💾 {size_str}"
+        stats += "  🌸 Erai-raws"
+
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
+
+        stream_name = "Nyaa"
+        if resolution:
+            stream_name += f"\n{resolution}"
+
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0 if kind == "single" else file_idx_by_pos.get(pos),
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "behaviorHints": {
-                "bingeGroup": f"piratebay|{resolution or 'unknown'}",
+                "bingeGroup": f"nyaa-erai|{resolution or 'unknown'}",
                 "videoSize": size_bytes,
                 "filename": name,
             },
             "_seeders": seeders,
         })
 
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
     return results
 
 
@@ -275,11 +629,6 @@ def scrape_limetorrents(query: str, max_results: int = 20):
             "infoHash": infohash,
             "fileIdx": 0,
             "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
-            "behaviorHints": {
-                "bingeGroup": f"limetorrents|{resolution or 'unknown'}",
-                "videoSize": size_bytes,
-                "filename": name,
-            },
             "_seeders": row["seeders"],
         })
 
