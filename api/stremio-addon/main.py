@@ -3,12 +3,16 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from routers.tmdb import (
     TMDB_API_KEY,
-    TMDB_BASE_URL,
-    get_popular_movies,
-    get_movie_details,
-    get_serie_details,
+    TMDB_BASE_URL
 )
-from scrapper import scrape_limetorrents, scrape_piratebay, scrape_nyaa_erai
+from scrapper import (
+    scrape_limetorrents,
+    scrape_piratebay,
+    scrape_nyaa_erai,
+    scrape_yts,
+    scrape_bitsearch,
+    scrape_knaben,
+)
 import requests
 
 
@@ -150,60 +154,12 @@ def manifest():
         "version": "1.0.0",
         "name": "My Addon",
         "description": "Movies & Series, animes",
-        "resources": ["catalog", "meta", "stream"],
-        "types": ["movie", "series"],
-        "catalogs": [
-            {
-                "type": "movie",
-                "id": "tmdb-popular"
-            }
-        ]
+        "resources": ["stream"],
+        "types": ["movie", "series"]
     }
 
 # ----------------------------
-# 2. CATALOG (Home page list)
-# ----------------------------
-@app.get("/catalog/movie/tmdb-popular.json")
-def catalog():
-    movies = get_popular_movies()
-
-    metas = []
-    for m in movies:
-        metas.append({
-            "id": f"tmdb:{m['id']}",
-            "type": "movie",
-            "name": m["title"],
-            "poster": f"https://image.tmdb.org/t/p/w500{m['poster_path']}" if m.get("poster_path") else None,
-            "description": m.get("overview", "")
-        })
-
-    return {"metas": metas}
-
-# ----------------------------
-# 3. META (details page)
-# ----------------------------
-@app.get("/meta/movie/{id}.json")
-def meta(id: str):
-    tmdb_id = id.replace("tmdb:", "")
-    data = get_movie_details(tmdb_id)
-
-    return {
-        "meta": {
-            "id": id,
-            "type": "movie",
-            "name": data.get("title"),
-            "description": data.get("overview"),
-            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}",
-            "background": f"https://image.tmdb.org/t/p/w780{data.get('backdrop_path')}"
-        }
-    }
-
-@app.get("/meta/{type}/{id}.json")
-def meta(type:str, id: str):
-    return get_serie_details(type, id)
-
-# ----------------------------
-# 4. STREAM (PLAY LINKS)
+# 2. STREAM (PLAY LINKS)
 # ----------------------------
 @app.get("/stream/movie/{id}.json")
 def stream(id: str):
@@ -215,14 +171,21 @@ def stream(id: str):
             _cached_title["v"] = _imdb_to_title_year(id)
         return _cached_title["v"]
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         f_pb = ex.submit(_scrape_with_fallback, scrape_piratebay, id, title_year)
-        f_lt = ex.submit(_scrape_with_fallback, scrape_limetorrents, id, title_year)
+        # f_lt = ex.submit(_scrape_with_fallback, scrape_limetorrents, id, title_year)
+        f_yts = ex.submit(_scrape_with_fallback, scrape_yts, id, title_year)
+        f_bs = ex.submit(_scrape_with_fallback, scrape_bitsearch, id, title_year)
+        f_kn = ex.submit(_scrape_with_fallback, scrape_knaben, id, title_year)
         pb_streams = f_pb.result()
-        lt_streams = f_lt.result()
+        # lt_streams = f_lt.result()
+        yts_streams = f_yts.result()
+        bs_streams = f_bs.result()
+        kn_streams = f_kn.result()
+        lt_streams = []
 
     seen = {}
-    for s in (*pb_streams, *lt_streams):
+    for s in (*pb_streams, *lt_streams, *yts_streams, *bs_streams, *kn_streams):
         h = (s.get("infoHash") or "").lower()
         if not h:
             continue
@@ -233,6 +196,11 @@ def stream(id: str):
     merged = sorted(seen.values(), key=lambda s: s.get("_seeders", 0), reverse=True)
     for s in merged:
         s.pop("_seeders", None)
+        # Don't pin fileIdx for movies — most movie torrents are single-file,
+        # and for multi-file folder releases Stremio's player will pick the
+        # largest video automatically once metadata comes in from the swarm.
+        # Hard-coding 0 is what made multi-file releases open the wrong file.
+        s.pop("fileIdx", None)
 
     return {"streams": merged}
 

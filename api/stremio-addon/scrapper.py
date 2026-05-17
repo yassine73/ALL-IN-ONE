@@ -23,41 +23,20 @@ _AUDIO_RE = re.compile(
 )
 _HDR_RE = re.compile(r"\b(HDR10\+?|HDR|DV|Dolby ?Vision)\b", re.IGNORECASE)
 
-# Public trackers verified responsive via UDP BEP-15 connect handshake.
-# Ordered by measured latency (lowest first) so clients try the fastest first.
-# Deduped: same IP+port and same-server-different-port collapsed to one entry.
-# Re-verify periodically — dead trackers add latency without benefit.
+# Measured-fastest public trackers (BEP-15 UDP connect, median of 3 samples).
+# Ordered by latency from where this addon runs — see bench_trackers.py to
+# re-measure. Kept short on purpose: every entry is tried for every stream,
+# so a dead or slow tracker delays peer discovery. The torrent's own trackers
+# (from its magnet URL) supply the long tail on top of these.
 _TRACKERS = [
-    "udp://tracker.torrent.eu.org:451/announce",        # ~44 ms
-    "udp://54.36.179.216:6969/announce",                # ~46 ms
-    "udp://135.125.236.64:6969/announce",               # ~49 ms
-    "udp://tracker.auctor.tv:6969/announce",            # ~53 ms
-    "udp://107.189.4.235:1337/announce",                # ~55 ms
-    "udp://5.255.124.190:6969/announce",                # ~55 ms
-    "udp://107.189.7.165:6969/announce",                # ~56 ms
-    "udp://185.171.202.111:6969/announce",              # ~60 ms
-    "udp://tracker.filemail.com:6969/announce",         # ~60 ms
-    "udp://37.120.182.83:54123/announce",               # ~65 ms (also serves buddyfly.top/torrentclub.space)
-    "udp://tracker.srv00.com:6969/announce",            # ~74 ms
-    "udp://87.106.210.134:6969/announce",               # ~80 ms
-    "udp://88.80.22.67:2710/announce",                  # ~83 ms
-    "udp://81.230.84.201:6969/announce",                # ~84 ms
-    "udp://open.stealth.si:80/announce",                # ~85 ms
-    "udp://185.146.233.150:6969/announce",              # ~87 ms
-    "udp://torrents.artixlinux.org:6969/announce",      # ~92 ms
-    "udp://tracker.opentrackr.org:1337/announce",       # ~94 ms
-    "udp://94.72.140.51:6969/announce",                 # ~95 ms
-    "udp://34.66.57.33:1337/announce",                  # ~135 ms
-    "udp://192.3.130.53:1337/announce",                 # ~141 ms
-    "udp://94.136.190.183:1337/announce",               # ~148 ms
-    "udp://23.175.184.30:23333/announce",               # ~164 ms
-    "udp://209.141.59.25:6969/announce",                # ~184 ms
-    "udp://tracker.theoks.net:6969/announce",           # ~185 ms
-    "udp://189.18.162.12:6969/announce",                # ~205 ms
-    "udp://explodie.org:6969/announce",                 # ~214 ms
-    "udp://wepzone.net:6969/announce",                  # ~251 ms
-    "udp://open.demonii.com:1337/announce",             # ~304 ms
-    "udp://tracker.dler.com:6969/announce",             # ~333 ms
+    "udp://tracker.torrent.eu.org:451/announce",        # ~39 ms
+    "udp://tracker.plx.im:6969/announce",               # ~48 ms
+    "udp://tracker.tryhackx.org:6969/announce",         # ~51 ms
+    "udp://tracker.auctor.tv:6969/announce",            # ~59 ms
+    "udp://tracker.qu.ax:6969/announce",                # ~60 ms
+    "udp://tracker.t-1.org:6969/announce",              # ~61 ms
+    "udp://tracker.ducks.party:1984/announce",          # ~61 ms
+    "udp://tracker.srv00.com:6969/announce",            # ~78 ms
 ]
 
 
@@ -88,7 +67,7 @@ def _extract_resolution(name: str):
     return None
 
 
-def scrape_piratebay(query: str):
+def scrape_piratebay(query: str, max_results: int = 20):
     try:
         res = requests.get(
             "https://apibay.org/q.php",
@@ -102,8 +81,10 @@ def scrape_piratebay(query: str):
 
     results = []
     for obj in data:
-        infohash = obj.get("info_hash")
-        if not infohash or infohash == "0" * 40:
+        infohash = (obj.get("info_hash") or "").lower()
+        # Stremio requires lowercase; apibay returns uppercase. Also drop the
+        # "no results" sentinel row (all-zero hash, name="No results returned").
+        if not infohash or len(infohash) != 40 or infohash == "0" * 40:
             continue
 
         name = obj.get("name")
@@ -152,7 +133,8 @@ def scrape_piratebay(query: str):
             "_seeders": seeders,
         })
 
-    return results
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
+    return results[:max_results]
 
 
 # --- Nyaa (anime) ---------------------------------------------------------
@@ -514,6 +496,285 @@ def scrape_nyaa_erai(title: str, season: int, episode: int,
     return results
 
 
+# --- YTS ------------------------------------------------------------------
+
+_YTS_API = "https://movies-api.accel.li/api/v2/list_movies.json"
+_YTS_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+
+def scrape_yts(query: str, max_results: int = 20):
+    """Search YTS for movie torrents. `query` may be an IMDB id (ttNNNNNNN)
+    or a free-text title — YTS's `query_term` accepts both.
+
+    Each movie returns multiple torrents (720p/1080p/2160p/3D); we emit one
+    stream per torrent so Stremio can show quality choices.
+    """
+    if not query:
+        return []
+
+    try:
+        res = requests.get(
+            _YTS_API,
+            params={"query_term": query, "limit": min(max_results, 50)},
+            headers={"User-Agent": _YTS_UA},
+            timeout=15,
+        )
+        data = res.json()
+    except Exception:
+        return []
+
+    movies = ((data or {}).get("data") or {}).get("movies") or []
+    if not movies:
+        return []
+
+    results = []
+    for movie in movies:
+        title = movie.get("title_long") or movie.get("title") or ""
+        for t in movie.get("torrents") or []:
+            infohash = (t.get("hash") or "").lower()
+            if not infohash or len(infohash) != 40:
+                continue
+
+            quality = t.get("quality") or ""           # "720p", "1080p", "2160p", "3D"
+            type_ = t.get("type") or ""                # "bluray", "web", etc.
+            codec = t.get("video_codec") or ""         # "x264", "x265"
+            size_str = t.get("size") or ""
+            size_bytes = t.get("size_bytes")
+            try:
+                seeders = int(t.get("seeds") or 0)
+                leechers = int(t.get("peers") or 0)
+            except (TypeError, ValueError):
+                seeders = leechers = 0
+
+            resolution = quality.lower() if _RESOLUTION_RE.match(quality or "") else None
+
+            tag_line = " | ".join(p for p in (quality, type_.upper() if type_ else None, codec) if p)
+            stats = f"👤 {seeders} / {leechers}"
+            if size_str:
+                stats += f"  💾 {size_str}"
+            stats += "  🎬 YTS"
+
+            release_name = f"{title} [{quality}] [{type_}] [YTS]".strip()
+            title_parts = [release_name]
+            if tag_line:
+                title_parts.append(tag_line)
+            title_parts.append(stats)
+
+            stream_name = "YTS"
+            if resolution:
+                stream_name += f"\n{resolution}"
+
+            results.append({
+                "name": stream_name,
+                "title": "\n".join(title_parts),
+                "infoHash": infohash,
+                "fileIdx": 0,
+                "sources": [f"tracker:{tr}" for tr in _TRACKERS] + [f"dht:{infohash}"],
+                "behaviorHints": {
+                    "videoSize": size_bytes,
+                    "filename": release_name,
+                },
+                "_seeders": seeders,
+            })
+
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
+    return results[:max_results]
+
+
+# --- Knaben (meta-aggregator) --------------------------------------------
+
+_KNABEN_API = "https://api.knaben.org/v1"
+_KNABEN_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+_KNABEN_MOVIE_CATS = [3000000]  # Movies tree (3001000 = HD, 3002000 = SD, etc.)
+_MAGNET_TR_RE = re.compile(r"[?&]tr=([^&]+)")
+
+
+def _magnet_trackers(magnet_url: str):
+    """Pull `tr=` trackers out of a magnet URL, URL-decoded."""
+    if not magnet_url:
+        return []
+    from urllib.parse import unquote
+    return [unquote(m.group(1)) for m in _MAGNET_TR_RE.finditer(magnet_url)]
+
+
+def scrape_knaben(query: str, max_results: int = 20, categories=None):
+    """Search knaben.org's meta-aggregator (indexes TPB, YTS, RuTracker, …).
+
+    Server-side sort by seeders desc; client-side resort + truncate as a
+    safety net.
+    """
+    if not query:
+        return []
+
+    body = {
+        "query": query,
+        "search_type": "100%",
+        "search_field": "title",
+        "order_by": "seeders",
+        "order_direction": "desc",
+        "size": min(max(max_results, 1), 100),
+        "categories": categories or _KNABEN_MOVIE_CATS,
+    }
+
+    try:
+        res = requests.post(
+            _KNABEN_API,
+            json=body,
+            headers={"User-Agent": _KNABEN_UA, "Content-Type": "application/json"},
+            timeout=8,
+        )
+        data = res.json()
+    except Exception:
+        return []
+
+    results = []
+    for obj in (data or {}).get("hits") or []:
+        infohash = (obj.get("hash") or "").lower()
+        if not infohash or len(infohash) != 40 or infohash == "0" * 40:
+            continue
+
+        name = obj.get("title") or ""
+        if not name:
+            continue
+
+        try:
+            seeders = int(obj.get("seeders") or 0)
+            leechers = int(obj.get("peers") or 0)
+        except (TypeError, ValueError):
+            seeders = leechers = 0
+
+        size_bytes = obj.get("bytes") or None
+        size_str = _format_size(size_bytes) if size_bytes else ""
+        tracker = obj.get("tracker") or obj.get("cachedOrigin") or "Knaben"
+
+        # Critical: include the torrent's own trackers from its magnet URL.
+        # Knaben aggregates from many sites and each row carries its source
+        # site's trackers, where the actual seeders are announcing. Without
+        # these, peer discovery falls back to DHT-only.
+        own_trackers = _magnet_trackers(obj.get("magnetUrl") or "")
+        sources = (
+            [f"tracker:{t}" for t in own_trackers]
+            + [f"tracker:{t}" for t in _TRACKERS]
+            + [f"dht:{infohash}"]
+        )
+        resolution = _extract_resolution(name)
+        quality = _first_match(_QUALITY_RE, name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+
+        tag_line = " | ".join(t for t in (resolution, quality, codec, hdr, audio) if t)
+        stats = f"👤 {seeders} / {leechers}"
+        if size_str:
+            stats += f"  💾 {size_str}"
+        stats += f"  🧭 Knaben · {tracker}"
+
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
+
+        stream_name = "Knaben"
+        if resolution:
+            stream_name += f"\n{resolution}"
+
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0,
+            "sources": sources,
+            "_seeders": seeders,
+        })
+
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
+    return results[:max_results]
+
+
+# --- BitSearch (ex-SolidTorrents) ----------------------------------------
+
+_BITSEARCH_API = "https://bitsearch.eu/api/v1/search"
+_BITSEARCH_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+
+def scrape_bitsearch(query: str, max_results: int = 20):
+    """Search bitsearch.eu (DHT-sourced). Asks the API to sort by seeders
+    descending server-side so the truncation keeps the best torrents.
+    """
+    if not query:
+        return []
+    try:
+        res = requests.get(
+            _BITSEARCH_API,
+            params={
+                "q": query,
+                "sort": "seeders",
+                "order": "desc",
+                "category": 1,  # Movies
+                "limit": min(max(max_results, 1), 100),
+            },
+            headers={"User-Agent": _BITSEARCH_UA},
+            timeout=15,
+        )
+        data = res.json()
+    except Exception:
+        return []
+
+    if not (data or {}).get("success"):
+        return []
+
+    results = []
+    for obj in data.get("results") or []:
+        infohash = (obj.get("infohash") or "").lower()
+        if not infohash or len(infohash) != 40 or infohash == "0" * 40:
+            continue
+
+        name = obj.get("title") or ""
+        if not name:
+            continue
+
+        try:
+            seeders = int(obj.get("seeders") or 0)
+            leechers = int(obj.get("leechers") or 0)
+        except (TypeError, ValueError):
+            seeders = leechers = 0
+
+        size_bytes = obj.get("size") or None
+        size_str = _format_size(size_bytes) if size_bytes else ""
+        resolution = _extract_resolution(name)
+        quality = _first_match(_QUALITY_RE, name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+
+        tag_line = " | ".join(t for t in (resolution, quality, codec, hdr, audio) if t)
+        stats = f"👤 {seeders} / {leechers}"
+        if size_str:
+            stats += f"  💾 {size_str}"
+        stats += "  🔎 BitSearch"
+
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
+
+        stream_name = "BitSearch"
+        if resolution:
+            stream_name += f"\n{resolution}"
+
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0,
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "_seeders": seeders,
+        })
+
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
+    return results[:max_results]
+
+
 # --- LimeTorrents ---------------------------------------------------------
 
 _LIME_BASE = "https://limetorrent.in"
@@ -583,11 +844,12 @@ def scrape_limetorrents(query: str, max_results: int = 20):
             "seeders": seeders,
             "leechers": leechers,
         })
-        if len(rows) >= max_results:
-            break
 
     if not rows:
         return []
+
+    rows.sort(key=lambda r: r["seeders"], reverse=True)
+    rows = rows[:max_results]
 
     with ThreadPoolExecutor(max_workers=min(8, len(rows))) as ex:
         future_to_row = {ex.submit(_lime_fetch_hash, session, r["detail_url"]): r for r in rows}
@@ -632,4 +894,5 @@ def scrape_limetorrents(query: str, max_results: int = 20):
             "_seeders": row["seeders"],
         })
 
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
     return results
