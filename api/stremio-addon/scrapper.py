@@ -1,7 +1,14 @@
 import html
+import random
 import re
+import socket
+import statistics
+import struct
+import threading
+import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -23,21 +30,119 @@ _AUDIO_RE = re.compile(
 )
 _HDR_RE = re.compile(r"\b(HDR10\+?|HDR|DV|Dolby ?Vision)\b", re.IGNORECASE)
 
-# Measured-fastest public trackers (BEP-15 UDP connect, median of 3 samples).
-# Ordered by latency from where this addon runs — see bench_trackers.py to
-# re-measure. Kept short on purpose: every entry is tried for every stream,
-# so a dead or slow tracker delays peer discovery. The torrent's own trackers
-# (from its magnet URL) supply the long tail on top of these.
-_TRACKERS = [
-    "udp://tracker.torrent.eu.org:451/announce",        # ~39 ms
-    "udp://tracker.plx.im:6969/announce",               # ~48 ms
-    "udp://tracker.tryhackx.org:6969/announce",         # ~51 ms
-    "udp://tracker.auctor.tv:6969/announce",            # ~59 ms
-    "udp://tracker.qu.ax:6969/announce",                # ~60 ms
-    "udp://tracker.t-1.org:6969/announce",              # ~61 ms
-    "udp://tracker.ducks.party:1984/announce",          # ~61 ms
-    "udp://tracker.srv00.com:6969/announce",            # ~78 ms
-]
+# Trackers are pulled from ngosang/trackerslist (mirrored across three URLs),
+# probed (BEP-15 UDP connect), and the fastest _TRACKER_TOP_N working ones
+# are passed to Stremio. Kept short on purpose: every entry is tried for
+# every stream, so a dead/slow tracker delays peer discovery. The torrent's
+# own trackers (from its magnet URL) supply the long tail on top of these.
+_TRACKER_LIST_URLS = (
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+    "https://ngosang.github.io/trackerslist/trackers_best.txt",
+    "https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt",
+)
+_TRACKER_TOP_N = 5
+_TRACKER_CACHE_TTL = 600  # seconds
+_TRACKER_PROBE_TIMEOUT = 3.0
+_TRACKER_PROBE_SAMPLES = 2
+_TRACKER_LIST_FETCH_TIMEOUT = 8
+_BEP15_MAGIC = 0x41727101980
+
+_tracker_cache_lock = threading.Lock()
+_tracker_cache = {"trackers": [], "expires_at": 0.0}
+
+
+def _probe_tracker_once(host: str, port: int) -> float | None:
+    tid = random.randint(0, 0xFFFFFFFF)
+    pkt = struct.pack("!QII", _BEP15_MAGIC, 0, tid)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(_TRACKER_PROBE_TIMEOUT)
+    try:
+        s.connect((host, port))
+        t0 = time.perf_counter()
+        s.send(pkt)
+        data = s.recv(64)
+        dt = (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        return None
+    finally:
+        s.close()
+    if len(data) < 16:
+        return None
+    action, rtid = struct.unpack("!II", data[:8])
+    if action != 0 or rtid != tid:
+        return None
+    return dt
+
+
+def _probe_tracker(url: str):
+    p = urlparse(url)
+    if not p.hostname or not p.port:
+        return url, None
+    try:
+        addrs = socket.getaddrinfo(p.hostname, p.port, type=socket.SOCK_DGRAM)
+        host = addrs[0][4][0]
+    except Exception:
+        return url, None
+    samples = []
+    for _ in range(_TRACKER_PROBE_SAMPLES):
+        rtt = _probe_tracker_once(host, p.port)
+        if rtt is not None:
+            samples.append(rtt)
+    if not samples:
+        return url, None
+    return url, statistics.median(samples)
+
+
+def _load_tracker_candidates():
+    """Fetch the tracker list from ngosang/trackerslist, trying mirrors in order."""
+    for url in _TRACKER_LIST_URLS:
+        try:
+            r = requests.get(url, timeout=_TRACKER_LIST_FETCH_TIMEOUT)
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            body = r.text
+        except Exception:
+            continue
+        out = []
+        seen = set()
+        for line in body.splitlines():
+            u = line.strip()
+            if not u or u.startswith("#") or u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+        if out:
+            return out
+    return []
+
+
+def _get_trackers():
+    """Return the fastest working trackers.
+
+    Fetches the candidate list from ngosang/trackerslist and probes them,
+    caching the result for _TRACKER_CACHE_TTL seconds.
+    """
+    now = time.time()
+    with _tracker_cache_lock:
+        cached = _tracker_cache
+        if cached["trackers"] and cached["expires_at"] > now:
+            return list(cached["trackers"])
+
+    candidates = _load_tracker_candidates()
+    if not candidates:
+        return []
+
+    with ThreadPoolExecutor(max_workers=min(32, len(candidates))) as ex:
+        results = list(ex.map(_probe_tracker, candidates))
+    alive = [(u, ms) for (u, ms) in results if ms is not None]
+    alive.sort(key=lambda r: r[1])
+    top = [u for (u, _ms) in alive[:_TRACKER_TOP_N]]
+
+    with _tracker_cache_lock:
+        _tracker_cache["trackers"] = top
+        _tracker_cache["expires_at"] = now + _TRACKER_CACHE_TTL
+
+    return list(top)
 
 
 def _format_size(num_bytes):
@@ -129,7 +234,7 @@ def scrape_piratebay(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
             "_seeders": seeders,
         })
 
@@ -483,7 +588,7 @@ def scrape_nyaa_erai(title: str, season: int, episode: int,
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0 if kind == "single" else file_idx_by_pos.get(pos),
-            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
             "behaviorHints": {
                 "bingeGroup": f"nyaa-erai|{resolution or 'unknown'}",
                 "videoSize": size_bytes,
@@ -569,7 +674,7 @@ def scrape_yts(query: str, max_results: int = 20):
                 "title": "\n".join(title_parts),
                 "infoHash": infohash,
                 "fileIdx": 0,
-                "sources": [f"tracker:{tr}" for tr in _TRACKERS] + [f"dht:{infohash}"],
+                "sources": [f"tracker:{tr}" for tr in _get_trackers()] + [f"dht:{infohash}"],
                 "behaviorHints": {
                     "videoSize": size_bytes,
                     "filename": release_name,
@@ -654,7 +759,7 @@ def scrape_knaben(query: str, max_results: int = 20, categories=None):
         own_trackers = _magnet_trackers(obj.get("magnetUrl") or "")
         sources = (
             [f"tracker:{t}" for t in own_trackers]
-            + [f"tracker:{t}" for t in _TRACKERS]
+            + [f"tracker:{t}" for t in _get_trackers()]
             + [f"dht:{infohash}"]
         )
         resolution = _extract_resolution(name)
@@ -767,7 +872,7 @@ def scrape_bitsearch(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
             "_seeders": seeders,
         })
 
@@ -777,19 +882,10 @@ def scrape_bitsearch(query: str, max_results: int = 20):
 
 # --- LimeTorrents ---------------------------------------------------------
 
-_LIME_BASE = "https://limetorrent.in"
+_LIME_BASE = "https://www.limetorrents.fun"
 _LIME_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-_LIME_ROW_RE = re.compile(
-    r'<tr[^>]*>\s*<td class="tdleft">.*?'
-    r'<div class="tt-name">.*?<a\s+href="(?P<href>/post-detail/[^"]+)"[^>]*>(?P<name>.*?)</a>.*?'
-    r'<td class="tdnormal">(?P<date>[^<]*)</td>\s*'
-    r'<td class="tdnormal">(?P<size>[^<]*)</td>\s*'
-    r'<td class="tdseed">(?P<seed>[^<]*)</td>\s*'
-    r'<td class="tdleech">(?P<leech>[^<]*)</td>',
-    re.DOTALL,
-)
-_LIME_HASH_RE = re.compile(r"itorrents\.org/torrent/([A-Fa-f0-9]{40})\.torrent", re.IGNORECASE)
-_LIME_MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:([A-Fa-f0-9]{40})", re.IGNORECASE)
+_LIME_ENCLOSURE_HASH_RE = re.compile(r"/torrent/([A-Fa-f0-9]{40})\.torrent", re.IGNORECASE)
+_LIME_SEEDS_LEECH_RE = re.compile(r"Seeds?:\s*(\d+)\s*,\s*Leechers?\s*(\d+)", re.IGNORECASE)
 _SIZE_UNIT_BYTES = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
 
 
@@ -803,44 +899,70 @@ def _parse_size_to_bytes(size_str: str):
         return None
 
 
-def _lime_fetch_hash(session, detail_url):
-    try:
-        r = session.get(detail_url, timeout=15)
-        body = r.text
-    except Exception:
-        return None
-    m = _LIME_HASH_RE.search(body) or _LIME_MAGNET_RE.search(body)
-    return m.group(1).lower() if m else None
+def _format_bytes(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return f"{f:.2f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{n} B"
 
 
 def scrape_limetorrents(query: str, max_results: int = 20):
     if not query:
         return []
 
-    search_url = urljoin(_LIME_BASE, f"/get-posts/keywords:{quote(query)}/")
-    session = requests.Session()
-    session.headers.update({"User-Agent": _LIME_UA})
+    rss_url = f"{_LIME_BASE}/searchrss/{quote(query)}/"
 
     try:
-        res = session.get(search_url, timeout=20)
-        page = res.text
+        res = requests.get(rss_url, headers={"User-Agent": _LIME_UA}, timeout=20)
+        body = res.content
     except Exception:
         return []
 
+    end = body.rfind(b"</rss>")
+    if end != -1:
+        body = body[: end + len(b"</rss>")]
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return []
+
     rows = []
-    for m in _LIME_ROW_RE.finditer(page):
-        name = html.unescape(re.sub(r"<[^>]+>", "", m.group("name"))).strip()
+    for item in root.iterfind(".//item"):
+        title_el = item.find("title")
+        name = (title_el.text or "").strip() if title_el is not None else ""
         if not name:
             continue
+
+        infohash = None
+        enclosure = item.find("enclosure")
+        if enclosure is not None:
+            m = _LIME_ENCLOSURE_HASH_RE.search(enclosure.get("url", ""))
+            if m:
+                infohash = m.group(1).lower()
+        if not infohash:
+            continue
+
+        size_el = item.find("size")
         try:
-            seeders = int(m.group("seed").strip() or 0)
-            leechers = int(m.group("leech").strip() or 0)
+            size_bytes = int((size_el.text or "").strip()) if size_el is not None else 0
         except ValueError:
-            seeders = leechers = 0
+            size_bytes = 0
+
+        seeders = leechers = 0
+        desc_el = item.find("description")
+        if desc_el is not None and desc_el.text:
+            m = _LIME_SEEDS_LEECH_RE.search(desc_el.text)
+            if m:
+                seeders = int(m.group(1))
+                leechers = int(m.group(2))
+
         rows.append({
-            "name": name,
-            "detail_url": urljoin(_LIME_BASE, m.group("href")),
-            "size_str": m.group("size").strip(),
+            "name": html.unescape(name),
+            "infohash": infohash,
+            "size_str": _format_bytes(size_bytes) if size_bytes else "",
             "seeders": seeders,
             "leechers": leechers,
         })
@@ -850,11 +972,6 @@ def scrape_limetorrents(query: str, max_results: int = 20):
 
     rows.sort(key=lambda r: r["seeders"], reverse=True)
     rows = rows[:max_results]
-
-    with ThreadPoolExecutor(max_workers=min(8, len(rows))) as ex:
-        future_to_row = {ex.submit(_lime_fetch_hash, session, r["detail_url"]): r for r in rows}
-        for fut in as_completed(future_to_row):
-            future_to_row[fut]["infohash"] = fut.result()
 
     results = []
     for row in rows:
@@ -890,7 +1007,154 @@ def scrape_limetorrents(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "_seeders": row["seeders"],
+        })
+
+    results.sort(key=lambda s: s.get("_seeders", 0), reverse=True)
+    return results
+
+
+# --- 1337x -----------------------------------------------------------------
+# The primary 1337x.to domain sits behind a Cloudflare JS challenge that can't
+# be cleared without a real browser — unworkable on Termux. The 1377x.to mirror
+# serves the same content over plain HTTPS, so we hit it directly. It is slow
+# (commonly 5-15s) and occasionally times out; one retry is enough.
+
+_X1337_BASE = "https://www.1377x.to"
+_X1337_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+_X1337_ROW_RE = re.compile(
+    r'<tr>\s*<td[^>]*class="coll-1 name"[^>]*>'
+    r'(?:\s*<a[^>]*class="icon"[^>]*>.*?</a>\s*)*'
+    r'<a\s+href="(?P<href>/torrent/[^"]+)"[^>]*>(?P<name>.*?)</a>\s*</td>\s*'
+    r'<td[^>]*class="coll-2 seeds"[^>]*>(?P<seed>\d+)</td>\s*'
+    r'<td[^>]*class="coll-3 leeches"[^>]*>(?P<leech>\d+)</td>\s*'
+    r'<td[^>]*class="coll-date"[^>]*>[^<]*</td>\s*'
+    r'<td[^>]*class="coll-4 size[^"]*"[^>]*>(?P<size>.*?)</td>',
+    re.DOTALL,
+)
+_X1337_MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:([A-Fa-f0-9]{40})", re.IGNORECASE)
+_X1337_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_X1337_STOPWORDS = {"the", "and", "of", "a", "an", "in", "on", "to", "for", "with", "or"}
+
+
+def _x1337_query_tokens(query: str):
+    return [
+        t for t in _X1337_TOKEN_RE.findall(query.lower())
+        if len(t) >= 2 and t not in _X1337_STOPWORDS
+    ]
+
+
+def _x1337_title_matches(name: str, tokens):
+    if not tokens:
+        return True
+    name_tokens = set(_X1337_TOKEN_RE.findall(name.lower()))
+    return all(t in name_tokens for t in tokens)
+
+
+def _x1337_get(session, url, timeout=30, retries=1):
+    for attempt in range(retries + 1):
+        try:
+            return session.get(url, timeout=timeout).text
+        except requests.RequestException:
+            if attempt == retries:
+                return None
+
+
+def _x1337_fetch_hash(session, detail_url):
+    body = _x1337_get(session, detail_url)
+    if not body:
+        return None
+    m = _X1337_MAGNET_RE.search(body)
+    return m.group(1).lower() if m else None
+
+
+def scrape_1337x(query: str, max_results: int = 20, category: str = "Movies"):
+    if not query:
+        return []
+
+    query_tokens = _x1337_query_tokens(query)
+    if not query_tokens:
+        return []
+
+    # 1337x search treats some short words ("and", "the", …) as operators
+    # and returns OR-matches sorted by global seeders — feeding the raw title
+    # often surfaces top-seeded movies that share only a stopword or the year.
+    # Send the tokenised query (stopwords already stripped) instead.
+    site_query = " ".join(query_tokens)
+    search_url = f"{_X1337_BASE}/sort-category-search/{quote(site_query)}/{category}/seeders/desc/1/"
+    session = requests.Session()
+    session.headers.update({"User-Agent": _X1337_UA})
+
+    page = _x1337_get(session, search_url, timeout=30, retries=1)
+    if not page:
+        return []
+
+    rows = []
+    for m in _X1337_ROW_RE.finditer(page):
+        name = html.unescape(re.sub(r"<[^>]+>", "", m.group("name"))).strip()
+        if not name:
+            continue
+        if not _x1337_title_matches(name, query_tokens):
+            continue
+        size_str = html.unescape(re.sub(r"<[^>]+>", "", m.group("size"))).strip()
+        try:
+            seeders = int(m.group("seed"))
+            leechers = int(m.group("leech"))
+        except ValueError:
+            seeders = leechers = 0
+        rows.append({
+            "name": name,
+            "detail_url": _X1337_BASE + m.group("href"),
+            "size_str": size_str,
+            "seeders": seeders,
+            "leechers": leechers,
+        })
+
+    if not rows:
+        return []
+
+    rows = rows[:max_results]
+
+    with ThreadPoolExecutor(max_workers=min(6, len(rows))) as ex:
+        future_to_row = {ex.submit(_x1337_fetch_hash, session, r["detail_url"]): r for r in rows}
+        for fut in as_completed(future_to_row):
+            future_to_row[fut]["infohash"] = fut.result()
+
+    results = []
+    for row in rows:
+        infohash = row.get("infohash")
+        if not infohash:
+            continue
+
+        name = row["name"]
+        resolution = _extract_resolution(name)
+        quality = _first_match(_QUALITY_RE, name)
+        codec = _first_match(_CODEC_RE, name)
+        audio = _first_match(_AUDIO_RE, name)
+        hdr = _first_match(_HDR_RE, name)
+
+        tag_line = " | ".join(t for t in (resolution, quality, codec, hdr, audio) if t)
+        stats = f"👤 {row['seeders']} / {row['leechers']}"
+        if row["size_str"]:
+            stats += f"  💾 {row['size_str']}"
+        stats += "  🎯 1337x"
+
+        title_parts = [name]
+        if tag_line:
+            title_parts.append(tag_line)
+        title_parts.append(stats)
+
+        stream_name = "1337x"
+        if resolution:
+            stream_name += f"\n{resolution}"
+
+        results.append({
+            "name": stream_name,
+            "title": "\n".join(title_parts),
+            "infoHash": infohash,
+            "fileIdx": 0,
+            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
             "_seeders": row["seeders"],
         })
 

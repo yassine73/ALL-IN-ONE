@@ -12,6 +12,7 @@ from scrapper import (
     scrape_yts,
     scrape_bitsearch,
     scrape_knaben,
+    scrape_1337x,
 )
 import requests
 
@@ -171,21 +172,22 @@ def stream(id: str):
             _cached_title["v"] = _imdb_to_title_year(id)
         return _cached_title["v"]
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         f_pb = ex.submit(_scrape_with_fallback, scrape_piratebay, id, title_year)
-        # f_lt = ex.submit(_scrape_with_fallback, scrape_limetorrents, id, title_year)
+        f_lt = ex.submit(_scrape_with_fallback, scrape_limetorrents, id, title_year)
         f_yts = ex.submit(_scrape_with_fallback, scrape_yts, id, title_year)
         f_bs = ex.submit(_scrape_with_fallback, scrape_bitsearch, id, title_year)
         f_kn = ex.submit(_scrape_with_fallback, scrape_knaben, id, title_year)
+        f_xx = ex.submit(_scrape_with_fallback, scrape_1337x, id, title_year)
         pb_streams = f_pb.result()
-        # lt_streams = f_lt.result()
+        lt_streams = f_lt.result()
         yts_streams = f_yts.result()
         bs_streams = f_bs.result()
         kn_streams = f_kn.result()
-        lt_streams = []
+        xx_streams = f_xx.result()
 
     seen = {}
-    for s in (*pb_streams, *lt_streams, *yts_streams, *bs_streams, *kn_streams):
+    for s in (*pb_streams, *lt_streams, *yts_streams, *bs_streams, *kn_streams, *xx_streams):
         h = (s.get("infoHash") or "").lower()
         if not h:
             continue
