@@ -41,14 +41,16 @@ _TRACKER_LIST_URLS = (
     "https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt",
 )
 _TRACKER_TOP_N = 5
-_TRACKER_CACHE_TTL = 600  # seconds
 _TRACKER_PROBE_TIMEOUT = 3.0
 _TRACKER_PROBE_SAMPLES = 2
 _TRACKER_LIST_FETCH_TIMEOUT = 8
 _BEP15_MAGIC = 0x41727101980
 
-_tracker_cache_lock = threading.Lock()
-_tracker_cache = {"trackers": [], "expires_at": 0.0}
+# Probed once per process on the first endpoint call via ensure_trackers().
+# Scrapers read _TRACKERS directly — no per-result lookups, no TTL refresh.
+_tracker_init_lock = threading.Lock()
+_tracker_initialized = False
+_TRACKERS: list[str] = []
 
 
 def _probe_tracker_once(host: str, port: int) -> float | None:
@@ -116,33 +118,28 @@ def _load_tracker_candidates():
     return []
 
 
-def _get_trackers():
-    """Return the fastest working trackers.
+def ensure_trackers() -> list[str]:
+    """Probe the tracker list once per process and return the result.
 
-    Fetches the candidate list from ngosang/trackerslist and probes them,
-    caching the result for _TRACKER_CACHE_TTL seconds.
+    Subsequent calls are a cheap read — the probing only happens on the very
+    first invocation (typically the first endpoint hit). Scrapers should not
+    call this; they read `_TRACKERS` directly.
     """
-    now = time.time()
-    with _tracker_cache_lock:
-        cached = _tracker_cache
-        if cached["trackers"] and cached["expires_at"] > now:
-            return list(cached["trackers"])
-
-    candidates = _load_tracker_candidates()
-    if not candidates:
-        return []
-
-    with ThreadPoolExecutor(max_workers=min(32, len(candidates))) as ex:
-        results = list(ex.map(_probe_tracker, candidates))
-    alive = [(u, ms) for (u, ms) in results if ms is not None]
-    alive.sort(key=lambda r: r[1])
-    top = [u for (u, _ms) in alive[:_TRACKER_TOP_N]]
-
-    with _tracker_cache_lock:
-        _tracker_cache["trackers"] = top
-        _tracker_cache["expires_at"] = now + _TRACKER_CACHE_TTL
-
-    return list(top)
+    global _tracker_initialized, _TRACKERS
+    if _tracker_initialized:
+        return _TRACKERS
+    with _tracker_init_lock:
+        if _tracker_initialized:
+            return _TRACKERS
+        candidates = _load_tracker_candidates()
+        if candidates:
+            with ThreadPoolExecutor(max_workers=min(32, len(candidates))) as ex:
+                results = list(ex.map(_probe_tracker, candidates))
+            alive = [(u, ms) for (u, ms) in results if ms is not None]
+            alive.sort(key=lambda r: r[1])
+            _TRACKERS = [u for (u, _ms) in alive[:_TRACKER_TOP_N]]
+        _tracker_initialized = True
+        return _TRACKERS
 
 
 def _format_size(num_bytes):
@@ -234,7 +231,7 @@ def scrape_piratebay(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "_seeders": seeders,
         })
 
@@ -588,7 +585,7 @@ def scrape_nyaa_erai(title: str, season: int, episode: int,
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0 if kind == "single" else file_idx_by_pos.get(pos),
-            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "behaviorHints": {
                 "bingeGroup": f"nyaa-erai|{resolution or 'unknown'}",
                 "videoSize": size_bytes,
@@ -674,7 +671,7 @@ def scrape_yts(query: str, max_results: int = 20):
                 "title": "\n".join(title_parts),
                 "infoHash": infohash,
                 "fileIdx": 0,
-                "sources": [f"tracker:{tr}" for tr in _get_trackers()] + [f"dht:{infohash}"],
+                "sources": [f"tracker:{tr}" for tr in _TRACKERS] + [f"dht:{infohash}"],
                 "behaviorHints": {
                     "videoSize": size_bytes,
                     "filename": release_name,
@@ -759,7 +756,7 @@ def scrape_knaben(query: str, max_results: int = 20, categories=None):
         own_trackers = _magnet_trackers(obj.get("magnetUrl") or "")
         sources = (
             [f"tracker:{t}" for t in own_trackers]
-            + [f"tracker:{t}" for t in _get_trackers()]
+            + [f"tracker:{t}" for t in _TRACKERS]
             + [f"dht:{infohash}"]
         )
         resolution = _extract_resolution(name)
@@ -872,7 +869,7 @@ def scrape_bitsearch(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "_seeders": seeders,
         })
 
@@ -1007,7 +1004,7 @@ def scrape_limetorrents(query: str, max_results: int = 20):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "_seeders": row["seeders"],
         })
 
@@ -1154,7 +1151,7 @@ def scrape_1337x(query: str, max_results: int = 20, category: str = "Movies"):
             "title": "\n".join(title_parts),
             "infoHash": infohash,
             "fileIdx": 0,
-            "sources": [f"tracker:{t}" for t in _get_trackers()] + [f"dht:{infohash}"],
+            "sources": [f"tracker:{t}" for t in _TRACKERS] + [f"dht:{infohash}"],
             "_seeders": row["seeders"],
         })
 

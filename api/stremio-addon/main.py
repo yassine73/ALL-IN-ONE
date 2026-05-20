@@ -1,11 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from routers.tmdb import (
     TMDB_API_KEY,
     TMDB_BASE_URL
 )
 from scrapper import (
+    ensure_trackers,
     scrape_limetorrents,
     scrape_piratebay,
     scrape_nyaa_erai,
@@ -143,7 +145,16 @@ def _scrape_with_fallback(scraper, imdb_id: str, fallback_query):
 
 app = FastAPI()
 
-ADDON_ID = "com.myaddonlocal.tmdb-addon"
+# Stremio loads addons via XHR from app.strem.io and the desktop webview;
+# without permissive CORS the manifest fetch silently fails on macOS.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ADDON_ID = "com.myaddonlocal.test3"
 
 # ----------------------------
 # 1. MANIFEST
@@ -152,11 +163,13 @@ ADDON_ID = "com.myaddonlocal.tmdb-addon"
 def manifest():
     return {
         "id": ADDON_ID,
-        "version": "1.0.0",
+        "version": "1.0.3",
         "name": "My Addon",
         "description": "Movies & Series, animes",
         "resources": ["stream"],
-        "types": ["movie", "series"]
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt"],
+        "catalogs": [],
     }
 
 # ----------------------------
@@ -164,6 +177,7 @@ def manifest():
 # ----------------------------
 @app.get("/stream/movie/{id}.json")
 def stream(id: str):
+    ensure_trackers()
     # Cache the TMDB resolution so we only hit it once even if both scrapers fall back.
     _cached_title = {}
 
@@ -210,6 +224,7 @@ def stream(id: str):
 # Example: /stream/series/tt0131179:3:14.json
 @app.get("/stream/series/{id}.json")
 def stream_series(id: str):
+    ensure_trackers()
     parts = id.split(":")
     if len(parts) != 3:
         return {"streams": []}
