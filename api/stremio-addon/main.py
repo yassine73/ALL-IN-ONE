@@ -154,7 +154,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ADDON_ID = "com.myaddonlocal.test3"
+ADDON_ID = "com.stremioaddon.torrenest"
 
 # ----------------------------
 # 1. MANIFEST
