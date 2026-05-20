@@ -1,5 +1,7 @@
+import re
 from concurrent.futures import ThreadPoolExecutor
 
+import PTN
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.tmdb import (
@@ -17,6 +19,91 @@ from scrapper import (
     scrape_1337x,
 )
 import requests
+
+
+# --- Torrentio-style relevance filter -------------------------------------
+# Trackers return a lot of noise: TV shows when you searched a movie, titles
+# that merely *contain* the wanted word ("Far Away" for "Away"), foreign
+# alt-title combos ("Projam aka Away"), and CAM rips. We parse the release
+# name with PTN, then drop anything that doesn't match title + year.
+
+_BAD_QUALITY_RE = re.compile(
+    r"\b(CAM|HDCAM|CAMRip|HDTS|TS|TC|TELESYNC|TELECINE|KORSUB|HDTC)\b",
+    re.IGNORECASE,
+)
+_LEADING_BRACKETS_RE = re.compile(r"^\s*(?:\[[^\]]*\]|\([^)]*\))\s*")
+_ARTICLES = {"the", "a", "an"}
+
+
+def _release_name(stream: dict) -> str:
+    # Every scraper puts the raw release name on the first line of `title`.
+    return (stream.get("title") or "").split("\n", 1)[0]
+
+
+def _tokens(s: str) -> list:
+    # Lowercase, replace non-alphanumerics with spaces, split. Keeps numbers
+    # intact (years, sequel numbers like "Number 24").
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split()
+
+
+def _strip_leading_brackets(name: str) -> str:
+    # Releases often start with [Group] or (Encoder) prefixes; strip those
+    # before checking what the actual title at position 0 is.
+    while True:
+        m = _LEADING_BRACKETS_RE.match(name)
+        if not m:
+            return name
+        name = name[m.end():]
+
+
+def _drop_leading_article(toks: list) -> list:
+    return toks[1:] if toks and toks[0] in _ARTICLES else toks
+
+
+def _matches_one_title(rel_toks: list, want_title: str,
+                       want_year: int | None) -> bool:
+    title_toks = _drop_leading_article(_tokens(want_title))
+    if not title_toks:
+        return False
+    if rel_toks[:len(title_toks)] != title_toks:
+        return False
+    if want_year:
+        idx = len(title_toks)
+        valid_years = {str(want_year), str(want_year - 1), str(want_year + 1)}
+        if idx >= len(rel_toks) or rel_toks[idx] not in valid_years:
+            return False
+    return True
+
+
+def _matches_movie(name: str, titles: list, want_year: int | None) -> bool:
+    # Reject TV: any release whose name parses as having a season or episode.
+    p = PTN.parse(name)
+    if p.get("season") is not None or p.get("episode") is not None:
+        return False
+
+    cleaned = _strip_leading_brackets(name)
+    rel_toks = _drop_leading_article(_tokens(cleaned))
+    if not rel_toks:
+        return False
+
+    # Accept the release if it matches ANY known title (primary, original,
+    # or TMDB alternative). This is what catches "Nr. 24" (original Norwegian
+    # title) and "Numero 24" (Italian alt) for the movie "Number 24".
+    return any(_matches_one_title(rel_toks, t, want_year) for t in titles)
+
+
+def _filter_movie_streams(streams: list, titles: list, want_year):
+    titles = [t for t in (titles or []) if t]
+    if not titles:
+        return streams  # No metadata → can't safely filter.
+    kept = []
+    for s in streams:
+        name = _release_name(s)
+        if _BAD_QUALITY_RE.search(name):
+            continue
+        if _matches_movie(name, titles, want_year):
+            kept.append(s)
+    return kept
 
 
 def _cinemeta_absolute_episode(imdb_id: str, season: int, episode: int):
@@ -106,31 +193,67 @@ def _imdb_to_tv_info(imdb_id: str):
     }
 
 
-def _imdb_to_title_year(imdb_id: str):
-    """Resolve IMDB id → 'Title YEAR' via TMDB. Returns None if not found."""
+def _imdb_to_movie_info(imdb_id: str):
+    """Resolve IMDB id → {title, year, titles[]} via TMDB.
+
+    `titles` includes the primary title, original_title, and all
+    `alternative_titles` — used to match foreign-language releases and
+    AKAs (e.g. "Nr. 24" / "Numero 24" for "Number 24"). The list is
+    deduplicated case-insensitively.
+    """
+    empty = {"title": None, "year": None, "titles": []}
     if not imdb_id or not imdb_id.startswith("tt"):
-        return None
+        return empty
     try:
-        r = requests.get(
+        find = requests.get(
             f"{TMDB_BASE_URL}/find/{imdb_id.split(':')[0]}",
             params={"api_key": TMDB_API_KEY, "external_source": "imdb_id"},
             timeout=10,
-        )
-        data = r.json()
+        ).json()
     except Exception:
-        return None
-    for key in ("movie_results", "tv_results"):
-        items = data.get(key) or []
-        if not items:
-            continue
-        item = items[0]
-        title = item.get("title") or item.get("name")
-        date = item.get("release_date") or item.get("first_air_date") or ""
-        year = date[:4] if date else ""
-        if title and year:
-            return f"{title} {year}"
-        return title
-    return None
+        return empty
+    items = find.get("movie_results") or find.get("tv_results") or []
+    if not items:
+        return empty
+    item = items[0]
+    is_movie = "title" in item
+    tmdb_id = item.get("id")
+    primary = item.get("title") or item.get("name")
+    date = item.get("release_date") or item.get("first_air_date") or ""
+    year = int(date[:4]) if date[:4].isdigit() else None
+
+    # One extra call to grab original_title + alternative_titles together.
+    titles = [primary]
+    try:
+        kind = "movie" if is_movie else "tv"
+        detail = requests.get(
+            f"{TMDB_BASE_URL}/{kind}/{tmdb_id}",
+            params={
+                "api_key": TMDB_API_KEY,
+                "append_to_response": "alternative_titles",
+            },
+            timeout=10,
+        ).json()
+        original = detail.get("original_title") or detail.get("original_name")
+        if original:
+            titles.append(original)
+        alt = (detail.get("alternative_titles") or {}).get("titles") or []
+        for a in alt:
+            t = a.get("title")
+            if t:
+                titles.append(t)
+    except Exception:
+        pass
+
+    # Dedupe case-insensitively, preserve order.
+    seen = set()
+    deduped = []
+    for t in titles:
+        k = (t or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            deduped.append(t.strip())
+    return {"title": primary, "year": year, "titles": deduped}
 
 
 def _scrape_with_fallback(scraper, imdb_id: str, fallback_query):
@@ -154,7 +277,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ADDON_ID = "com.stremioaddon.torrenest"
+ADDON_ID = "com.myaddonlocal.test3"
 
 # ----------------------------
 # 1. MANIFEST
@@ -178,13 +301,17 @@ def manifest():
 @app.get("/stream/movie/{id}.json")
 def stream(id: str):
     ensure_trackers()
-    # Cache the TMDB resolution so we only hit it once even if both scrapers fall back.
-    _cached_title = {}
+    # Resolve TMDB once: primary title + alt titles for relevance filtering,
+    # plus a "Title YEAR" string for scraper fallback queries.
+    info = _imdb_to_movie_info(id)
+    want_title = info["title"]
+    want_year = info["year"]
+    want_titles = info["titles"]
+    _ty = (f"{want_title} {want_year}" if want_title and want_year
+           else want_title)
 
     def title_year():
-        if "v" not in _cached_title:
-            _cached_title["v"] = _imdb_to_title_year(id)
-        return _cached_title["v"]
+        return _ty
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         f_pb = ex.submit(_scrape_with_fallback, scrape_piratebay, id, title_year)
@@ -200,8 +327,13 @@ def stream(id: str):
         kn_streams = f_kn.result()
         xx_streams = f_xx.result()
 
+    all_streams = list(pb_streams) + list(lt_streams) + list(yts_streams) \
+        + list(bs_streams) + list(kn_streams) + list(xx_streams)
+    # Drop CAM rips, wrong-year, wrong-title, and TV-show leaks before dedupe.
+    filtered = _filter_movie_streams(all_streams, want_titles, want_year)
+
     seen = {}
-    for s in (*pb_streams, *lt_streams, *yts_streams, *bs_streams, *kn_streams, *xx_streams):
+    for s in filtered:
         h = (s.get("infoHash") or "").lower()
         if not h:
             continue
